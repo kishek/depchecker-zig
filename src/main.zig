@@ -1,5 +1,6 @@
 const std = @import("std");
-    
+const Async = @import("thread_pool_async.zig");
+
 const supported_extensions = std.ComptimeStringMap(void, .{
     .{".ts"},
     .{".tsx"},
@@ -8,6 +9,10 @@ const supported_extensions = std.ComptimeStringMap(void, .{
 });
 
 pub fn main() !void {
+    try Async.run(asyncMain, .{});
+}
+
+pub fn asyncMain() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(!gpa.deinit());
 
@@ -36,9 +41,9 @@ pub fn main() !void {
     var json = try parser.parse(contents);
     defer json.deinit();
 
-    var dependency_map = std.StringHashMap(u16).init(allocator);
+    var dependency_map = std.StringHashMap(u16).init(Async.allocator);
     defer dependency_map.deinit();
-    
+
     const maybe_dependencies = json.root.Object.get("dependencies");
     if (maybe_dependencies) |dependencies| {
         const dependency_names = dependencies.Object.keys();
@@ -57,40 +62,43 @@ pub fn main() !void {
 
     const directory = try std.fs.openIterableDirAbsolute(src_dir, .{});
     std.debug.print("src_dir opened {s}\n", .{src_dir});
-    
+
     var walker = try directory.walk(allocator);
     defer walker.deinit();
 
-    var tasks = std.ArrayList(@Frame(analyzeFile)).init(allocator);
+    var tasks = std.ArrayList(Async.JoinHandle(Async.ReturnTypeOf(analyzeFile))).init(allocator);
     defer tasks.deinit();
-
-    var loop: std.event.Loop = undefined;
-    try loop.initMultiThreaded();
-    defer loop.deinit();
-
-    loop.run();
 
     while (try walker.next()) |entry| {
         if (entry.kind != std.fs.File.Kind.File) {
             continue;
         }
 
-        var extension_start = std.mem.lastIndexOf(u8, entry.basename, ".");
-        if (extension_start) |start| {
-            var extension = entry.basename[start..];
+        // TODO - provide ignore patterns CLI property
+        // TODO - add some logic for ignoring mega-long source-mappings in lines (buffer overflow)
+        if (std.mem.indexOf(u8, entry.path, "/dist/") != null) {
+            continue;
+        }
+        if (std.mem.indexOf(u8, entry.path, "/__compiled__/") != null) {
+            continue;
+        }
 
-            if (supported_extensions.has(extension)) {
-                var frame = async analyzeFile(directory.dir, entry.path, &dependency_map);
-                try tasks.append(frame);
-            }
+        var extension_start = std.mem.lastIndexOf(u8, entry.basename, ".") orelse 0;
+        var extension = entry.basename[extension_start..];
+
+        if (supported_extensions.has(extension)) {
+            var entry_path_full = try std.fmt.allocPrint(Async.allocator, "{s}/{s}", .{ src_dir, entry.path });
+
+            var frame = Async.spawn(analyzeFile, .{entry_path_full, &dependency_map});
+            try tasks.append(frame);
         }
     }
 
     const task_handles = tasks.toOwnedSlice();
     defer allocator.free(task_handles);
-    
+
     for (task_handles) |*handle| {
-        try await handle;
+        try handle.join();
     }
 
     var map_iterator = dependency_map.iterator();
@@ -106,10 +114,9 @@ pub fn main() !void {
             try stdout.print("dependency used: {s}\n", .{key});
         }
     }
-
 }
 
-const import_symbol: []const u8 = "from ";
+const import_symbol = "from ";
 const other_symbols = std.ComptimeStringMap(void, .{
     .{"export"},
     .{"const"},
@@ -117,45 +124,31 @@ const other_symbols = std.ComptimeStringMap(void, .{
     .{"interface"},
     .{"function"},
 });
+const trim_left_symbols: []const u8 = "\"'";
+const trim_right_symbols: []const u8 = "\"';";
 
-fn analyzeFile(src_dir: std.fs.Dir, file_path: []const u8, map: *std.StringHashMap(u16)) !void {
-    const file = try src_dir.openFile(file_path, .{});
+fn analyzeFile(file_path: []const u8, map: *std.StringHashMap(u16)) !void {
+    const file = try std.fs.openFileAbsolute(file_path, .{});
     defer file.close();
 
     var buffered_reader = std.io.bufferedReader(file.reader());
     var buffered_stream = buffered_reader.reader();
 
-    var buffered_line: [1024]u8 = undefined;
+    var buffered_line: [8192]u8 = undefined;
 
     while (try buffered_stream.readUntilDelimiterOrEof(&buffered_line, '\n')) |line| {
-        var import_start = std.mem.indexOf(u8, line, import_symbol);
-        if (import_start) |start| {
-            var import_start_at = start + 5;
-            var import_end_at = import_start_at;
-            
-            if (import_start_at == line.len or (line[import_start_at] != '\'' and line[import_start_at] != '"')) {
-                continue;
-            }
-            
-            
-            var found = false;
-            while (import_end_at != line.len - 1) {
-                import_end_at += 1;
-                if (line[import_end_at] == '\'' or line[import_end_at] == '"') {
-                    found = true;
-                    break;
-                }
-            }
-            
-            if (!found) {
-                continue;
-            }
+        if (std.mem.indexOf(u8, line, import_symbol) != null) {
+            var tokens = std.mem.split(u8, line, "from ");
+            _ = tokens.first();
 
-            const import_name = line[import_start_at + 1..import_end_at];
+            var import = tokens.rest();
 
-            var count = map.get(import_name);
+            import = std.mem.trimLeft(u8, import, trim_left_symbols);
+            import = std.mem.trimRight(u8, import, trim_right_symbols);
+
+            var count = map.get(import);
             if (count) |value| {
-                _ = try map.put(import_name, value + 1);
+                _ = try map.put(import, value + 1);
             }
         }
     }

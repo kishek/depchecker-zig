@@ -11,10 +11,13 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("zig-example", "src/main.zig");
+    const exe = b.addExecutable("depchecker-zig", "src/main.zig");
+    exe.addPackagePath("thread_pool", "./src/thread_pool.zig");
+    exe.addPackagePath("thread_pool_async", "./src/thread_pool_async.zig");
+
     exe.setTarget(target);
     exe.setBuildMode(mode);
-    exe.use_stage1 = true;
+    exe.linkLibC();
     exe.install();
 
     const run_cmd = exe.run();
